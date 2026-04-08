@@ -1,4 +1,5 @@
-import React, { createContext, useState, useContext, ReactNode } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import React, { createContext, useState, useContext, ReactNode, useEffect } from 'react';
 import { MOCK_NOTES, Note, DEFAULT_CATEGORIES, DEFAULT_CATEGORY_COLORS, DEFAULT_CATEGORY_LABELS, NEW_CATEGORY_PALETTE } from './mockData';
 
 export interface CategoryInfo {
@@ -31,11 +32,52 @@ interface NotesContextProps {
 const NotesContext = createContext<NotesContextProps | undefined>(undefined);
 
 export const NotesProvider = ({ children }: { children: ReactNode }) => {
-  const [notes, setNotes] = useState<Note[]>(MOCK_NOTES);
+  const [notes, setNotes] = useState<Note[]>([]);
   const [isCustomOrder, setIsCustomOrder] = useState<boolean>(false);
   const [customCategories, setCustomCategories] = useState<CategoryInfo[]>([]);
+  const [isReady, setIsReady] = useState(false);
+
+  useEffect(() => {
+    const loadData = async () => {
+      try {
+        const storedNotes = await AsyncStorage.getItem('@idnotes_notes');
+        const storedCats = await AsyncStorage.getItem('@idnotes_cats');
+        
+        if (storedNotes) {
+          const parsedNotes = JSON.parse(storedNotes);
+          setNotes(parsedNotes.map((n: any) => ({ ...n, updatedAt: n.updatedAt ? new Date(n.updatedAt) : new Date() })));
+        } else {
+          setNotes(MOCK_NOTES);
+        }
+        
+        if (storedCats) {
+          setCustomCategories(JSON.parse(storedCats));
+        }
+      } catch (e) {
+        console.error('Erro ao carregar dados locais:', e);
+        if (notes.length === 0) setNotes(MOCK_NOTES);
+      } finally {
+        setIsReady(true);
+      }
+    };
+    loadData();
+  }, []);
+
+  useEffect(() => {
+    if (isReady) {
+      AsyncStorage.setItem('@idnotes_notes', JSON.stringify(notes)).catch(e => console.error(e));
+    }
+  }, [notes, isReady]);
+
+  useEffect(() => {
+    if (isReady) {
+      AsyncStorage.setItem('@idnotes_cats', JSON.stringify(customCategories)).catch(e => console.error(e));
+    }
+  }, [customCategories, isReady]);
 
   const allCategories = [...BUILT_IN, ...customCategories];
+
+  if (!isReady) return null;
 
   const getCategoryColor = (catId: string): string => {
     const found = allCategories.find(c => c.id === catId);

@@ -709,7 +709,7 @@ export default function EditorScreen() {
         animationType="slide"
         onRequestClose={() => setCategoryModalVisible(false)}
       >
-        <View style={styles.catModalOverlay}>
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.catModalOverlay}>
           <Pressable style={styles.modalBackdrop} onPress={() => setCategoryModalVisible(false)} />
           <View style={styles.catBottomSheet}>
             <View style={styles.catHeader}>
@@ -772,7 +772,7 @@ export default function EditorScreen() {
               </TouchableOpacity>
             </View>
           </View>
-        </View>
+        </KeyboardAvoidingView>
       </Modal>
 
     </SafeAreaView>
