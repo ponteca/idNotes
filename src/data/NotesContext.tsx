@@ -23,7 +23,7 @@ interface NotesContextProps {
   updateNote: (id: string, updatedNote: Partial<Note>) => void;
   deleteNote: (id: string) => void;
   reorderNotes: (newNotes: Note[]) => void;
-  addCategory: (label: string) => CategoryInfo;
+  addCategory: (label: string, color?: string) => CategoryInfo;
   deleteCategory: (catId: string) => void;
   getCategoryColor: (catId: string) => string;
   getCategoryLabel: (catId: string) => string;
@@ -55,7 +55,7 @@ export const NotesProvider = ({ children }: { children: ReactNode }) => {
         }
       } catch (e) {
         console.error('Erro ao carregar dados locais:', e);
-        if (notes.length === 0) setNotes(MOCK_NOTES);
+        setNotes(MOCK_NOTES);
       } finally {
         setIsReady(true);
       }
@@ -89,13 +89,13 @@ export const NotesProvider = ({ children }: { children: ReactNode }) => {
     return found?.label || DEFAULT_CATEGORY_LABELS[catId] || catId;
   };
 
-  const addCategory = (label: string): CategoryInfo => {
+  const addCategory = (label: string, color?: string): CategoryInfo => {
     const id = label.trim().toLowerCase().replace(/\s+/g, '-');
     const existing = allCategories.find(c => c.id === id);
     if (existing) return existing;
 
     const colorIndex = customCategories.length % NEW_CATEGORY_PALETTE.length;
-    const newCat: CategoryInfo = { id, label: label.trim(), color: NEW_CATEGORY_PALETTE[colorIndex] };
+    const newCat: CategoryInfo = { id, label: label.trim(), color: color || NEW_CATEGORY_PALETTE[colorIndex] };
     setCustomCategories(prev => [...prev, newCat]);
     return newCat;
   };
@@ -111,7 +111,14 @@ export const NotesProvider = ({ children }: { children: ReactNode }) => {
   };
 
   const addNote = (note: Note) => {
-    setNotes((prevNotes) => [note, ...prevNotes]);
+    setNotes((prevNotes) => {
+      const existingIndex = prevNotes.findIndex(existing => existing.id === note.id);
+      if (existingIndex >= 0) {
+        return prevNotes.map(existing => existing.id === note.id ? note : existing);
+      }
+
+      return [note, ...prevNotes];
+    });
   };
 
   const updateNote = (id: string, updatedNote: Partial<Note>) => {

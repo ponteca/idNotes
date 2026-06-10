@@ -16,6 +16,24 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
    npx expo start
    ```
 
+## Aplicativo desktop
+
+O projeto tambem pode rodar como aplicativo de computador via Electron.
+
+Para abrir o app desktop em modo local:
+
+```bash
+npm run desktop
+```
+
+Para gerar o instalador do Windows:
+
+```bash
+npm run dist:win
+```
+
+O instalador sera criado em `release/idNotes-Setup-1.0.0.exe`.
+
 In the output, you'll find options to open the app in a
 
 - [development build](https://docs.expo.dev/develop/development-builds/introduction/)

@@ -8,16 +8,14 @@ import {
   FlatList,
   KeyboardAvoidingView,
   Platform,
-  TouchableWithoutFeedback,
   Keyboard,
   SafeAreaView,
-  Alert,
   StatusBar
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useNotes } from '../data/NotesContext';
 import { Note } from '../data/mockData';
-import { Redirect, useRouter } from 'expo-router';
+import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 export default function PosLoginScreen() {

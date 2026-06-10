@@ -1,0 +1,55 @@
+# RNF013 - Orquestração stateless: API + PostgreSQL + Redis.
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 8443
+      DATABASE_URL: postgres://idnotes:idnotes@postgres:5432/idnotes
+      REDIS_URL: redis://redis:6379
+      IDKEY_HMAC_SECRET: ${IDKEY_HMAC_SECRET:-troque-este-segredo-em-producao}
+      JWT_SECRET: ${JWT_SECRET:-troque-este-jwt-em-producao}
+      BCRYPT_ROUNDS: "12"
+      RATE_LIMIT_MAX: "3"
+      RATE_LIMIT_WINDOW_SECONDS: "600"
+      # TLS terminado por proxy reverso em produção (ver README).
+      TLS_ENABLED: "false"
+      TLS_BEHIND_PROXY: "true"
+    ports:
+      - "8443:8443"
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: idnotes
+      POSTGRES_PASSWORD: idnotes
+      POSTGRES_DB: idnotes
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Cria a tabela no primeiro boot (RNF005: só hash da idKey).
+      - ./src/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U idnotes -d idnotes"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:

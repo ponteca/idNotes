@@ -1,9 +1,9 @@
 import { Ionicons } from '@expo/vector-icons';
 import React, { useMemo, useRef, useState } from 'react';
 import {
-  Alert,
   Animated as RNAnimated,
   Dimensions,
+  FlatList,
   Modal,
   Platform,
   Pressable,
@@ -17,19 +17,14 @@ import {
   TextInput
 } from 'react-native';
 import Animated, {
-  useSharedValue,
-  useAnimatedStyle,
-  withSpring,
-  withRepeat,
-  withSequence,
-  runOnJS,
   LinearTransition,
-  withTiming
 } from 'react-native-reanimated';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
-import { Category, FilterCategory, Note } from '../data/mockData';
+import { FilterCategory, Note } from '../data/mockData';
 import { useRouter } from 'expo-router';
 import { useNotes } from '../data/NotesContext';
+import { useToast } from '../components/Toast';
+import { clearSession } from '../data/session';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 const { height: SCREEN_HEIGHT } = Dimensions.get('window');
@@ -40,22 +35,21 @@ type RowData =
 
 export default function HomeScreen() {
   const router = useRouter();
-  const { notes, deleteNote, updateNote, isCustomOrder, reorderNotes, allCategories, getCategoryColor, getCategoryLabel } = useNotes();
+  const { notes, deleteNote, updateNote, isCustomOrder, allCategories, getCategoryColor, getCategoryLabel } = useNotes();
+  const { showToast } = useToast();
   const insets = useSafeAreaInsets();
 
   // Filtros dinâmicos derivados das categorias
   const filterOptions: FilterCategory[] = useMemo(() => {
       return ['todas', ...allCategories.map(c => c.id)];
   }, [allCategories]);
-  const [layouts, setLayouts] = useState<Record<string, { x: number, y: number, width: number, height: number }>>({});
-  const layoutCache = useRef(layouts);
-  layoutCache.current = layouts;
   const [filter, setFilter] = useState<FilterCategory>('todas');
   const [isSearching, setIsSearching] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
   const [deleteModalVisible, setDeleteModalVisible] = useState(false);
   const [noteToDelete, setNoteToDelete] = useState<string | null>(null);
+  const [logoutModalVisible, setLogoutModalVisible] = useState(false);
 
   // Controle de Animação do Bottom Sheet
   const [modalVisible, setModalVisible] = useState(false);
@@ -114,51 +108,51 @@ export default function HomeScreen() {
     return filtered;
   }, [notes, filter, isCustomOrder, searchQuery]);
 
-  const handleReorderDrop = (draggedId: string, finalRelativeX: number, finalRelativeY: number) => {
-    if (filter !== 'todas') return; // Bloqueia reordenação em filtros
-
-    const draggedLayout = layoutCache.current[draggedId];
-    if (!draggedLayout) return;
-
-    const dropTargetX = draggedLayout.x + finalRelativeX + draggedLayout.width / 2;
-    const dropTargetY = draggedLayout.y + finalRelativeY + draggedLayout.height / 2;
-
-    let hoveredId = null;
-    for (const [id, lay] of Object.entries(layoutCache.current)) {
-      if (id !== draggedId) {
-        // Checa se o centro do arrastado está dentro da hitbox do outro card
-        if (dropTargetX >= lay.x && dropTargetX <= lay.x + lay.width &&
-            dropTargetY >= lay.y && dropTargetY <= lay.y + lay.height) {
-            hoveredId = id;
-            break;
-        }
+  // RNF007: agrupa as notas em linhas para virtualização via FlatList.
+  // Notas "sem_categoria" ocupam a linha inteira; as demais são paginadas
+  // em pares (grade de 2 colunas), preservando a ordem cronológica.
+  const rows: RowData[] = useMemo(() => {
+    const result: RowData[] = [];
+    let pendingDouble: Note | null = null;
+    const flushPending = () => {
+      if (pendingDouble) {
+        result.push({ type: 'pair', id: `pair-${pendingDouble.id}`, left: pendingDouble });
+        pendingDouble = null;
+      }
+    };
+    for (const note of sortedNotes) {
+      if (note.category === 'sem_categoria') {
+        flushPending();
+        result.push({ type: 'single', id: note.id, note });
+      } else if (pendingDouble) {
+        result.push({ type: 'pair', id: `pair-${pendingDouble.id}-${note.id}`, left: pendingDouble, right: note });
+        pendingDouble = null;
+      } else {
+        pendingDouble = note;
       }
     }
+    flushPending();
+    return result;
+  }, [sortedNotes]);
 
-    if (hoveredId) {
-      const allNotes = [...notes];
-      const dIdx = allNotes.findIndex(n => n.id === draggedId);
-      const hIdx = allNotes.findIndex(n => n.id === hoveredId);
-      if (dIdx >= 0 && hIdx >= 0) {
-        const item = allNotes.splice(dIdx, 1)[0];
-        allNotes.splice(allNotes.findIndex(n => n.id === hoveredId), 0, item);
-        reorderNotes(allNotes);
-      }
+  const renderRow = ({ item }: { item: RowData }) => {
+    if (item.type === 'single') {
+      return <NoteCard note={item.note} />;
     }
-  };
-
-  const handleLayout = (id: string, event: any) => {
-    const layout = event.nativeEvent?.layout;
-    if (!layout) return;
-    setLayouts(prev => ({ ...prev, [id]: layout }));
-    layoutCache.current[id] = layout;
+    return (
+      <View style={styles.flexWrapContainer}>
+        <NoteCard note={item.left} />
+        {item.right ? <NoteCard note={item.right} /> : <View style={styles.cardDouble} />}
+      </View>
+    );
   };
 
   // Ações de usuário
   const handleConfirmDelete = () => {
     if (noteToDelete) {
       deleteNote(noteToDelete);
-      // Mensagem de sucesso removida para agilizar o fluxo
+      // RNF009: feedback ao excluir nota
+      showToast('Nota excluída', 'info');
       setNoteToDelete(null);
       setDeleteModalVisible(false);
     }
@@ -167,6 +161,14 @@ export default function HomeScreen() {
   const cancelDelete = () => {
     setNoteToDelete(null);
     setDeleteModalVisible(false);
+  };
+
+  // RF005: logout remove a sessão local e volta para a apresentação (T-01).
+  const handleConfirmLogout = async () => {
+    setLogoutModalVisible(false);
+    await clearSession();
+    showToast('Sessão encerrada', 'info');
+    router.replace('/01apresentacao');
   };
 
   const handleOpenNote = (id: string) => {
@@ -256,6 +258,14 @@ export default function HomeScreen() {
               </Text>
             )}
           </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.cardDeleteButton}
+            onPress={triggerDeleteMenu}
+            accessibilityLabel="Excluir nota"
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          >
+            <Ionicons name="trash-outline" size={15} color="#a0a7b5" />
+          </TouchableOpacity>
         </Animated.View>
     );
   };
@@ -292,6 +302,9 @@ export default function HomeScreen() {
                 <TouchableOpacity style={styles.iconButton} accessibilityLabel="Buscar" onPress={() => setIsSearching(true)}>
                   <Ionicons name="search" size={24} color="#ffffff" />
                 </TouchableOpacity>
+                <TouchableOpacity style={styles.iconButton} accessibilityLabel="Sair" onPress={() => setLogoutModalVisible(true)}>
+                  <Ionicons name="log-out-outline" size={24} color="#ffffff" />
+                </TouchableOpacity>
               </View>
             </>
           )}
@@ -315,18 +328,23 @@ export default function HomeScreen() {
           </ScrollView>
         </View>
 
-        {/* Grade de Notas Otimizada c/ FlexWrap e DND */}
-        {sortedNotes.length > 0 ? (
-          <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.listContent}>
-            <View style={styles.flexWrapContainer}>
-               {sortedNotes.map(note => <NoteCard key={note.id} note={note} />)}
+        {/* Grade de Notas virtualizada (RNF007: FlatList p/ até 100 notas) */}
+        <FlatList
+          data={rows}
+          keyExtractor={(item) => item.id}
+          renderItem={renderRow}
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={[styles.listContent, rows.length === 0 && { flexGrow: 1 }]}
+          initialNumToRender={10}
+          maxToRenderPerBatch={10}
+          windowSize={11}
+          removeClippedSubviews={Platform.OS !== 'web'}
+          ListEmptyComponent={(
+            <View style={styles.emptyContainer}>
+              <Text style={styles.emptyText}>Nenhuma nota encontrada.</Text>
             </View>
-          </ScrollView>
-        ) : (
-          <View style={styles.emptyContainer}>
-            <Text style={styles.emptyText}>Nenhuma nota encontrada.</Text>
-          </View>
-        )}
+          )}
+        />
 
         {/* FAB Criar Nota */}
         <TouchableOpacity style={[styles.fab, { bottom: Math.max(24, insets.bottom + 10) }]} activeOpacity={0.8} onPress={handleCreateNote}>
@@ -386,6 +404,30 @@ export default function HomeScreen() {
               </TouchableOpacity>
               <TouchableOpacity style={styles.deleteDialogConfirmBtn} onPress={handleConfirmDelete}>
                 <Text style={styles.deleteDialogConfirmText}>Excluir</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Modal de Logout (RF005) */}
+      <Modal
+        visible={logoutModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setLogoutModalVisible(false)}
+      >
+        <View style={styles.deleteDialogOverlay}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setLogoutModalVisible(false)} />
+          <View style={styles.logoutDialog}>
+            <Text style={styles.deleteDialogTitle}>Encerrar sessão?</Text>
+            <Text style={styles.deleteDialogSubtext}>Você precisará da sua idKey para entrar novamente.</Text>
+            <View style={styles.deleteDialogActions}>
+              <TouchableOpacity style={styles.deleteDialogCancelBtn} onPress={() => setLogoutModalVisible(false)}>
+                <Text style={styles.deleteDialogCancelText}>Cancelar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.logoutConfirmBtn} onPress={handleConfirmLogout}>
+                <Text style={styles.deleteDialogConfirmText}>Sair</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -483,6 +525,20 @@ const styles = StyleSheet.create({
     borderRightColor: '#2a324a',
     borderBottomColor: '#2a324a',
     minHeight: 120,
+    position: 'relative',
+  },
+  cardDeleteButton: {
+    position: 'absolute',
+    right: 10,
+    bottom: 10,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: 'rgba(10, 14, 26, 0.72)',
+    borderWidth: 1,
+    borderColor: '#2a324a',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   cardSingle: {
     width: '100%',
@@ -653,5 +709,20 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontSize: 14,
     fontWeight: 'bold',
+  },
+  logoutDialog: {
+    backgroundColor: '#111827',
+    borderRadius: 16,
+    padding: 24,
+    width: '80%',
+    maxWidth: 400,
+    borderWidth: 1,
+    borderColor: '#2a324a',
+  },
+  logoutConfirmBtn: {
+    backgroundColor: '#007AFF',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
   },
 });

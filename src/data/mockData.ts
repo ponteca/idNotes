@@ -14,7 +14,24 @@ export const DEFAULT_CATEGORY_LABELS: Record<string, string> = {
 };
 
 // Paleta de cores para categorias novas
-export const NEW_CATEGORY_PALETTE = ['#5856D6', '#FF2D55', '#00C7BE', '#BF5AF2', '#FF6482', '#30D158', '#64D2FF', '#FFD60A'];
+export const NEW_CATEGORY_PALETTE = [
+  '#5856D6',
+  '#007AFF',
+  '#0A84FF',
+  '#64D2FF',
+  '#00C7BE',
+  '#30D158',
+  '#A3E635',
+  '#FFD60A',
+  '#FF9F0A',
+  '#FF6B35',
+  '#FF453A',
+  '#FF2D55',
+  '#BF5AF2',
+  '#AF52DE',
+  '#8E8E93',
+  '#FFFFFF',
+];
 
 export interface TaskItem {
   id: string;

@@ -9,18 +9,17 @@ import {
   KeyboardAvoidingView,
   Platform,
   ScrollView,
-  Alert,
   Modal,
   Pressable,
   StatusBar,
-  Keyboard,
   Image
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { Category, DEFAULT_CATEGORIES } from '../data/mockData';
+import { Category, DEFAULT_CATEGORIES, NEW_CATEGORY_PALETTE } from '../data/mockData';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import * as ImagePicker from 'expo-image-picker';
 import { useNotes } from '../data/NotesContext';
+import { useToast } from '../components/Toast';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 // Cores da Fonte (ALT 03)
@@ -47,12 +46,77 @@ interface Block {
   id: string;
   type: BlockType;
   content: string;
-  formatting?: Formatting;
+  formatting?: Formatting;     // legado: formatação do bloco inteiro (fallback)
+  spans?: TextSpan[];          // formatação inline por trecho (tem prioridade)
   checked?: boolean; // Para tasklists (RF-021)
   imageUri?: string; // Para imagens
   imageName?: string;
   imageSize?: number; // Em MB
 }
+
+// Trecho de texto com formatação própria (formatação inline por seleção).
+interface TextSpan {
+  text: string;
+  formatting: Formatting;
+}
+
+// Comparação de formatação (para fundir trechos contíguos iguais).
+const sameFmt = (a: Formatting, b: Formatting) =>
+  !!a.bold === !!b.bold && !!a.underline === !!b.underline && (a.color || '') === (b.color || '');
+
+// Lista de trechos do bloco; se não houver spans, usa o formatting do bloco.
+const getSpans = (block: Block): TextSpan[] => {
+  if (block.spans && block.spans.length) return block.spans;
+  return [{ text: block.content, formatting: block.formatting || {} }];
+};
+
+// Explode o bloco em caracteres com sua formatação (índices em code units,
+// alinhados com a seleção do TextInput).
+const blockToChars = (block: Block): { ch: string; fmt: Formatting }[] => {
+  const arr: { ch: string; fmt: Formatting }[] = [];
+  for (const s of getSpans(block)) {
+    for (let i = 0; i < s.text.length; i++) arr.push({ ch: s.text[i], fmt: { ...s.formatting } });
+  }
+  return arr;
+};
+
+// Reagrupa caracteres em trechos contíguos com a mesma formatação.
+const charsToSpans = (arr: { ch: string; fmt: Formatting }[]): TextSpan[] => {
+  const spans: TextSpan[] = [];
+  for (const c of arr) {
+    const last = spans[spans.length - 1];
+    if (last && sameFmt(last.formatting, c.fmt)) last.text += c.ch;
+    else spans.push({ text: c.ch, formatting: { ...c.fmt } });
+  }
+  return spans;
+};
+
+// Aplica a edição (texto novo) preservando a formatação dos trechos não tocados.
+// Diff por prefixo/sufixo comum; o texto inserido herda a formatação do
+// caractere anterior (ou da formatação ativa, se inserido no início).
+const reconcileChars = (
+  oldArr: { ch: string; fmt: Formatting }[],
+  newText: string,
+  fallbackFmt: Formatting
+): { ch: string; fmt: Formatting }[] => {
+  const oldText = oldArr.map(c => c.ch).join('');
+  if (oldText === newText) return oldArr;
+  let p = 0;
+  const minLen = Math.min(oldText.length, newText.length);
+  while (p < minLen && oldText[p] === newText[p]) p++;
+  let s = 0;
+  while (
+    s < oldText.length - p &&
+    s < newText.length - p &&
+    oldText[oldText.length - 1 - s] === newText[newText.length - 1 - s]
+  ) s++;
+  const removed = oldText.length - p - s;
+  const inserted = newText.substring(p, newText.length - s);
+  const fmt = p > 0 ? oldArr[p - 1].fmt
+    : (oldArr[p + removed] ? oldArr[p + removed].fmt : (fallbackFmt || {}));
+  const insArr = inserted.split('').map(ch => ({ ch, fmt: { ...fmt } }));
+  return [...oldArr.slice(0, p), ...insArr, ...oldArr.slice(p + removed)];
+};
 
 // Nota inicial mockada (poderia vir de props/params)
 const INITIAL_NOTE_DATA = {
@@ -76,13 +140,17 @@ export default function EditorScreen() {
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id?: string }>();
   const { notes, allCategories, addNote, updateNote, deleteNote, getCategoryColor, getCategoryLabel, addCategory, deleteCategory } = useNotes();
+  const { showToast } = useToast();
   const insets = useSafeAreaInsets();
+
+  // Id estável da nota: o param da rota OU um rascunho gerado (nota nova).
+  // Mantido aqui para que o resolvedData consiga localizar a nota recém-criada.
+  const draftIdRef = useRef(id || `note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
 
   const resolvedData = useMemo(() => {
      if (id === '2') return INITIAL_NOTE_DATA;
-     if (id) {
-       const found = notes.find(n => n.id === id);
-       if (found) {
+     const found = notes.find(n => n.id === (id || draftIdRef.current));
+     if (found) {
          if (found.rawBlocks) {
             try {
                 const parsed: Block[] = JSON.parse(found.rawBlocks);
@@ -104,7 +172,6 @@ export default function EditorScreen() {
              parsedBlocks.push({ id: 'empty', type: 'text', content: '', formatting: {} });
          }
          return { title: found.title, category: found.category, blocks: parsedBlocks };
-       }
      }
      return { title: '', category: 'sem_categoria' as Category, blocks: [{ id: 'empty-start', type: 'text', content: '', formatting: {} } as Block] };
   }, [id, notes]);
@@ -113,16 +180,21 @@ export default function EditorScreen() {
   const [category, setCategory] = useState<Category>(resolvedData.category);
   const [blocks, setBlocks] = useState<Block[]>(resolvedData.blocks);
 
+  // Sincroniza só quando muda a NOTA (id), não a cada alteração em `notes`.
+  // Evita que salvar (que altera `notes`) recarregue/limpe o editor.
   useEffect(() => {
      setTitle(resolvedData.title);
      setCategory(resolvedData.category);
      setBlocks(resolvedData.blocks);
-  }, [resolvedData]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
 
   // Estados da Toolbar
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
   const [activeFormats, setActiveFormats] = useState<Formatting>({});
   const [currentBlockType, setCurrentBlockType] = useState<BlockType>('text');
+  // Seleção atual dentro do bloco focado (índices em code units).
+  const [selection, setSelection] = useState<{ start: number; end: number }>({ start: 0, end: 0 });
   
   // Color Picker
   const [colorPickerVisible, setColorPickerVisible] = useState(false);
@@ -131,9 +203,11 @@ export default function EditorScreen() {
   // Seletor de Categoria
   const [categoryModalVisible, setCategoryModalVisible] = useState(false);
   const [newCategoryInput, setNewCategoryInput] = useState('');
+  const [newCategoryColor, setNewCategoryColor] = useState(NEW_CATEGORY_PALETTE[0]);
 
   const [isTrashPressed, setIsTrashPressed] = useState(false);
   const [deleteModalVisible, setDeleteModalVisible] = useState(false);
+  const [discardModalVisible, setDiscardModalVisible] = useState(false);
   const [newBlockId, setNewBlockId] = useState<string | null>(null);
 
   // Undo/Redo History
@@ -168,27 +242,65 @@ export default function EditorScreen() {
   };
 
   // References
-  const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const savedRef = useRef(false);            // evita salvar 2x (Salvar/Excluir + saída)
+  const initialSnapshotRef = useRef<string>('');
 
-  // Salvamento Automático (RF-024)
+  // Snapshot do estado carregado, para detectar alterações reais.
   useEffect(() => {
-    // Ao desmontar (ou sair da tela), executa o save.
-    return () => {
-      console.log("Salvamento automático realizado (RF-024).");
-      // Aqui integraria a chamada de API ou estado global.
-    };
-  }, []);
+    initialSnapshotRef.current = JSON.stringify({
+      title: resolvedData.title,
+      category: resolvedData.category,
+      blocks: resolvedData.blocks,
+    });
+    savedRef.current = false;
+    draftIdRef.current = id || draftIdRef.current;
+  }, [id, resolvedData]);
 
-  const triggerAutoSave = () => {
-    if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
-    saveTimeoutRef.current = setTimeout(() => {
-       console.log("Mock: Nota Auto-Salva");
-    }, 1000);
+  // Persiste a nota na memória local do dispositivo (via NotesContext ->
+  // AsyncStorage). Só grava quando houve mudança e ainda não foi salva.
+  const persistNote = () => {
+    if (savedRef.current || id === '2') return;
+    const snapshot = JSON.stringify({ title, category, blocks });
+    if (snapshot === initialSnapshotRef.current) return; // nada mudou
+
+    const textBlocks = blocks.filter(b => b.type === 'text' || b.type === 'h1').map(b => b.content).filter(Boolean);
+    const content = textBlocks.join('\n');
+    const rawBlocks = JSON.stringify(blocks);
+    const tasks = blocks.filter(b => b.type === 'task').map(b => ({ id: b.id, text: b.content, checked: !!b.checked }));
+    const payload = {
+      title: title || 'Nova nota',
+      category,
+      content,
+      rawBlocks,
+      hasTasklist: tasks.length > 0,
+      tasklistItems: tasks.length > 0 ? tasks : undefined,
+    };
+
+    const targetId = (id && notes.find(n => n.id === id)) ? id
+      : (notes.find(n => n.id === draftIdRef.current) ? draftIdRef.current : null);
+    if (targetId) {
+      updateNote(targetId, payload);
+    } else {
+      const hasContent = (title && title.trim().length > 0) ||
+        blocks.some(b => (b.content && b.content.trim().length > 0) || b.type === 'image');
+      if (hasContent) {
+        addNote({ id: draftIdRef.current, ...payload, updatedAt: new Date() });
+        savedRef.current = true;
+      }
+    }
   };
 
+  const hasUnsavedChanges = () => {
+    if (savedRef.current || id === '2') return false;
+    return JSON.stringify({ title, category, blocks }) !== initialSnapshotRef.current;
+  };
+
+  // RF-024: salvamento automático na memória local ao sair da tela.
+  const persistRef = useRef(persistNote);
+  persistRef.current = persistNote;
   useEffect(() => {
-    triggerAutoSave();
-  }, [title, blocks, category]);
+    return () => { persistRef.current(); };
+  }, []);
 
   // Manuseio de Categoria
   const handleSelectCategory = (catId: string) => {
@@ -199,41 +311,67 @@ export default function EditorScreen() {
   const handleCreateCategory = () => {
     const label = newCategoryInput.trim();
     if (!label) return;
-    const newCat = addCategory(label);
+    const newCat = addCategory(label, newCategoryColor);
     setCategory(newCat.id as Category);
     setNewCategoryInput('');
+    setNewCategoryColor(NEW_CATEGORY_PALETTE[0]);
     setCategoryModalVisible(false);
   };
 
-  // Ações de Toolbar
-  const handleToggleFormat = (format: keyof Formatting) => {
-    saveHistory(blocks);
-    setActiveFormats(prev => ({ ...prev, [format]: !prev[format] }));
-    
-    if (focusedBlockId) {
-      setBlocks(prev => prev.map(b => {
-        if (b.id === focusedBlockId && b.type !== 'image') {
-          return { ...b, formatting: { ...b.formatting, [format]: !b.formatting?.[format] } };
-        }
-        return b;
-      }));
+  // Atualiza a seleção e o destaque da toolbar conforme o trecho selecionado.
+  const handleSelectionChange = (block: Block, e: any) => {
+    const sel = e?.nativeEvent?.selection;
+    if (!sel) return;
+    setSelection(sel);
+    const chars = blockToChars(block);
+    const range = sel.start === sel.end
+      ? (sel.start > 0 ? chars.slice(sel.start - 1, sel.start) : [])
+      : chars.slice(sel.start, sel.end);
+    const fmt: Formatting = {};
+    if (range.length) {
+      fmt.bold = range.every(c => !!c.fmt.bold);
+      fmt.underline = range.every(c => !!c.fmt.underline);
+      const colors = new Set(range.map(c => c.fmt.color || ''));
+      fmt.color = colors.size === 1 ? (range[0].fmt.color || undefined) : undefined;
     }
+    setActiveFormats(fmt);
+  };
+
+  // Ações de Toolbar — aplicam formatação SOMENTE ao trecho selecionado.
+  // Sem seleção (cursor sem texto marcado), aplica ao bloco inteiro (fallback).
+  const applyFormatToSelection = (format: keyof Formatting, colorValue?: string) => {
+    if (!focusedBlockId) return;
+    saveHistory(blocks);
+    setBlocks(prev => prev.map(b => {
+      if (b.id !== focusedBlockId || b.type === 'image') return b;
+      const chars = blockToChars(b);
+      let start = Math.max(0, Math.min(selection.start, chars.length));
+      let end = Math.max(0, Math.min(selection.end, chars.length));
+      if (start > end) [start, end] = [end, start];
+      const from = start === end ? 0 : start;
+      const to = start === end ? chars.length : end;
+      let newChars;
+      if (format === 'color') {
+        newChars = chars.map((c, i) => (i >= from && i < to) ? { ch: c.ch, fmt: { ...c.fmt, color: colorValue } } : c);
+      } else {
+        const slice = chars.slice(from, to);
+        const allOn = slice.length > 0 && slice.every(c => !!c.fmt[format]);
+        newChars = chars.map((c, i) => (i >= from && i < to) ? { ch: c.ch, fmt: { ...c.fmt, [format]: !allOn } } : c);
+      }
+      return { ...b, content: newChars.map(c => c.ch).join(''), spans: charsToSpans(newChars), formatting: undefined };
+    }));
+  };
+
+  const handleToggleFormat = (format: keyof Formatting) => {
+    applyFormatToSelection(format);
+    setActiveFormats(prev => ({ ...prev, [format]: !prev[format] }));
   };
 
   const handleApplyColor = (color: string) => {
-    saveHistory(blocks);
     setLastColor(color);
     setColorPickerVisible(false);
+    applyFormatToSelection('color', color);
     setActiveFormats(prev => ({ ...prev, color }));
-    
-    if (focusedBlockId) {
-      setBlocks(prev => prev.map(b => {
-        if (b.id === focusedBlockId && b.type !== 'image') {
-          return { ...b, formatting: { ...b.formatting, color } };
-        }
-        return b;
-      }));
-    }
   };
 
   const handleToggleBlockType = (type: BlockType) => {
@@ -252,7 +390,12 @@ export default function EditorScreen() {
   };
 
   const handleBlockChangeText = (id: string, newText: string) => {
-    setBlocks(prev => prev.map(b => b.id === id ? { ...b, content: newText } : b));
+    setBlocks(prev => prev.map(b => {
+      if (b.id !== id) return b;
+      // Reconcilia mantendo a formatação dos trechos não alterados.
+      const chars = reconcileChars(blockToChars(b), newText, activeFormats);
+      return { ...b, content: newText, spans: charsToSpans(chars) };
+    }));
   };
 
   const handleToggleTaskCheck = (id: string) => {
@@ -287,7 +430,8 @@ export default function EditorScreen() {
         // Verifica tamanho se disponível (RF-023) - 5MB limite
         const sizeInMb = asset.fileSize ? asset.fileSize / (1024 * 1024) : 0;
         if (sizeInMb > 5) {
-          Alert.alert("Erro", "Imagem excede o limite de 5 MB (RF-023)");
+          // RNF009 + RF-023: feedback de erro ao exceder 5 MB
+          showToast('Imagem excede o limite de 5 MB', 'error');
           return;
         }
 
@@ -313,12 +457,27 @@ export default function EditorScreen() {
   };
 
   // Header Actions
-  const handleGoBack = () => {
+  const navigateAway = () => {
     if (router.canGoBack()) {
       router.back();
     } else {
       router.replace('/05home');
     }
+  };
+
+  const handleGoBack = () => {
+    if (hasUnsavedChanges()) {
+      setDiscardModalVisible(true);
+      return;
+    }
+
+    navigateAway();
+  };
+
+  const handleDiscardChanges = () => {
+    savedRef.current = true;
+    setDiscardModalVisible(false);
+    navigateAway();
   };
 
   const handleSaveAction = () => {
@@ -332,44 +491,40 @@ export default function EditorScreen() {
       checked: !!b.checked
     }));
 
-    if (id && notes.find(n => n.id === id)) {
-      updateNote(id, {
-        title: title || 'Nova nota',
-        category,
-        content,
-        rawBlocks,
+    const payload = {
+      title: title || 'Nova nota',
+      category,
+      content,
+      rawBlocks,
+      hasTasklist: tasks.length > 0,
+      tasklistItems: tasks.length > 0 ? tasks : undefined,
+    };
 
-        hasTasklist: tasks.length > 0,
-        tasklistItems: tasks.length > 0 ? tasks : undefined
-      });
+    // Atualiza se a nota já existe (pelo id da rota OU pelo rascunho criado);
+    // caso contrário, cria. Evita duplicar ao salvar a mesma nota nova 2x.
+    const existingId = (id && notes.find(n => n.id === id)) ? id
+      : (notes.find(n => n.id === draftIdRef.current) ? draftIdRef.current : null);
+
+    if (existingId) {
+      updateNote(existingId, payload);
     } else {
-      addNote({
-        id: Date.now().toString(),
-        title: title || 'Nova nota',
-        category,
-        content,
-        rawBlocks,
-
-        hasTasklist: tasks.length > 0,
-        tasklistItems: tasks.length > 0 ? tasks : undefined,
-        updatedAt: new Date()
-      });
+      addNote({ id: draftIdRef.current, ...payload, updatedAt: new Date() });
     }
 
-    // Mensagem de sucesso removida para não bloquear a interface
-    
-    if (router.canGoBack()) {
-      router.back();
-    } else {
-      router.replace('/05home');
-    }
+    // Marca o estado atual como "salvo" para o controle de alterações.
+    initialSnapshotRef.current = JSON.stringify({ title, category, blocks });
+
+    // RNF009: feedback de salvamento. NÃO fecha a nota — apenas atualiza.
+    showToast(existingId ? 'Nota salva' : 'Nota criada', 'success');
   };
 
   const handleConfirmDelete = () => {
     setDeleteModalVisible(false);
-    if (id) deleteNote(id);
-    // Mensagem de exclusão removida
-    
+    savedRef.current = true; // não recriar a nota no autosave de saída
+    deleteNote(id || draftIdRef.current);
+    // RNF009: feedback ao excluir nota
+    showToast('Nota excluída', 'info');
+
     if (router.canGoBack()) {
       router.back();
     } else {
@@ -379,6 +534,74 @@ export default function EditorScreen() {
 
   // Old handlers removed to use new prompt
 
+  // Campo editável com formatação inline por trecho (spans).
+  // Nativo: usa filhos <Text> por trecho (formatação real por seleção).
+  // Web: <textarea> não renderiza inline, então aplica estilo só se uniforme.
+  const renderEditableInput = (
+    block: Block,
+    baseStyle: any[],
+    placeholder: string,
+    autoCapitalize: 'characters' | 'sentences' = 'sentences',
+    forcePlain = false,
+  ) => {
+    const spans = getSpans(block);
+    const plain = spans.map(s => s.text).join('');
+    const common = {
+      autoFocus: newBlockId === block.id,
+      multiline: true as const,
+      scrollEnabled: false,
+      onChangeText: (t: string) => handleBlockChangeText(block.id, t),
+      onSelectionChange: (e: any) => handleSelectionChange(block, e),
+      onFocus: () => {
+        saveHistory(blocks);
+        setFocusedBlockId(block.id);
+        setCurrentBlockType(block.type === 'task' ? 'task' : block.type);
+      },
+      placeholder,
+      placeholderTextColor: '#8e95a5',
+      autoCapitalize,
+      onKeyPress: ({ nativeEvent }: any) => {
+        if (nativeEvent.key === 'Backspace' && block.content === '') handleDeleteBlockImmediate(block.id);
+      },
+    };
+
+    if (forcePlain || Platform.OS === 'web') {
+      const uniform = spans.length <= 1;
+      const f = spans[0]?.formatting || {};
+      return (
+        <TextInput
+          {...common}
+          value={plain}
+          style={[
+            ...baseStyle,
+            !forcePlain && uniform && f.bold && styles.textBold,
+            !forcePlain && uniform && f.underline && styles.textUnderline,
+            !forcePlain && uniform && f.color ? { color: f.color } : null,
+            Platform.OS === 'web' ? ({ outlineStyle: 'none', fieldSizing: 'content' } as any) : {},
+          ]}
+        />
+      );
+    }
+
+    return (
+      <TextInput {...common} style={baseStyle}>
+        {plain.length > 0
+          ? spans.map((s, i) => (
+              <Text
+                key={i}
+                style={[
+                  s.formatting.bold && styles.textBold,
+                  s.formatting.underline && styles.textUnderline,
+                  s.formatting.color ? { color: s.formatting.color } : null,
+                ]}
+              >
+                {s.text}
+              </Text>
+            ))
+          : null}
+      </TextInput>
+    );
+  };
 
   // Rendering
   const renderBlock = (block: Block, index: number) => {
@@ -421,35 +644,17 @@ export default function EditorScreen() {
                 <View style={styles.checkboxUnchecked} />
               )}
             </TouchableOpacity>
-            <TextInput
-              style={[
+            {renderEditableInput(
+              block,
+              [
                 styles.textInput,
                 styles.taskText,
                 block.checked && styles.taskTextChecked,
-                block.formatting?.bold && styles.textBold,
-                block.formatting?.underline && (!block.checked) && styles.textUnderline,
-                { color: block.formatting?.color || '#d1d5db' },
-                Platform.OS === 'web' ? { outlineStyle: 'none', fieldSizing: 'content' } as any : {},
-              ]}
-              autoFocus={newBlockId === block.id}
-              value={block.content}
-              onChangeText={(t) => handleBlockChangeText(block.id, t)}
-              multiline
-              scrollEnabled={false}
-              onFocus={() => {
-                saveHistory(blocks);
-                setFocusedBlockId(block.id);
-                setCurrentBlockType('task');
-                setActiveFormats(block.formatting || {});
-              }}
-              placeholder={focusedBlockId === block.id ? "Item da lista" : ""}
-              placeholderTextColor="#8e95a5"
-              onKeyPress={({ nativeEvent }) => {
-                if (nativeEvent.key === 'Backspace' && block.content === '') {
-                  handleDeleteBlockImmediate(block.id);
-                }
-              }}
-            />
+              ],
+              focusedBlockId === block.id ? 'Item da lista' : '',
+              'sentences',
+              !!block.checked, // tarefa concluída: texto riscado, sem inline
+            )}
           </View>
           {focusedBlockId === block.id && (
             <TouchableOpacity style={styles.deleteBlockIconText} onPress={() => handleDeleteBlockImmediate(block.id)}>
@@ -463,36 +668,16 @@ export default function EditorScreen() {
     // Default 'text' or 'h1'
     return (
       <View key={block.id} style={styles.textBlockRow}>
-        <TextInput
-          style={[
+        {renderEditableInput(
+          block,
+          [
             styles.textInput,
             block.type === 'h1' && styles.textH1,
-            block.formatting?.bold && styles.textBold,
-            block.formatting?.underline && styles.textUnderline,
-            { color: block.formatting?.color || '#d1d5db' },
             { flex: 1 },
-            Platform.OS === 'web' ? { outlineStyle: 'none', fieldSizing: 'content' } as any : {},
-          ]}
-          autoFocus={newBlockId === block.id}
-          value={block.content}
-          onChangeText={(t) => handleBlockChangeText(block.id, t)}
-          multiline
-          scrollEnabled={false}
-          onFocus={() => {
-             saveHistory(blocks);
-             setFocusedBlockId(block.id);
-             setCurrentBlockType(block.type);
-             setActiveFormats(block.formatting || {});
-          }}
-          placeholder={focusedBlockId === block.id ? (block.type === 'h1' ? 'TÍTULO' : 'Digite algo...') : ''}
-          placeholderTextColor="#8e95a5"
-          autoCapitalize={block.type === 'h1' ? 'characters' : 'sentences'}
-          onKeyPress={({ nativeEvent }) => {
-            if (nativeEvent.key === 'Backspace' && block.content === '') {
-              handleDeleteBlockImmediate(block.id);
-            }
-          }}
-        />
+          ],
+          focusedBlockId === block.id ? (block.type === 'h1' ? 'TÍTULO' : 'Digite algo...') : '',
+          block.type === 'h1' ? 'characters' : 'sentences',
+        )}
           {focusedBlockId === block.id && (
             <TouchableOpacity style={[styles.deleteBlockIconText, block.type === 'h1' && { marginTop: 16 }]} onPress={() => handleDeleteBlockImmediate(block.id)}>
               <Ionicons name="trash-outline" size={14} color="#4b5563" />
@@ -702,6 +887,29 @@ export default function EditorScreen() {
         </View>
       </Modal>
 
+      <Modal
+        visible={discardModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setDiscardModalVisible(false)}
+      >
+        <View style={styles.modalOverlayContainer}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setDiscardModalVisible(false)} />
+          <View style={styles.discardDialog}>
+            <Text style={styles.deleteDialogTitle}>Tem certeza que deseja descartar as alterações?</Text>
+            <Text style={styles.deleteDialogSubtext}>As mudanças feitas desde o último salvamento serão perdidas.</Text>
+            <View style={styles.deleteDialogActions}>
+              <TouchableOpacity style={styles.deleteDialogCancelBtn} onPress={() => setDiscardModalVisible(false)}>
+                <Text style={styles.deleteDialogCancelText}>Continuar editando</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.discardDialogConfirmBtn} onPress={handleDiscardChanges}>
+                <Text style={styles.deleteDialogConfirmText}>Descartar</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       {/* Category Picker Bottom Sheet */}
       <Modal
         visible={categoryModalVisible}
@@ -757,6 +965,28 @@ export default function EditorScreen() {
             </ScrollView>
 
             {/* Criar nova */}
+            <View style={styles.categoryColorSection}>
+              <Text style={styles.categoryColorTitle}>Cor da nova categoria</Text>
+              <View style={styles.categoryColorGrid}>
+                {NEW_CATEGORY_PALETTE.map(color => (
+                  <TouchableOpacity
+                    key={color}
+                    style={[
+                      styles.categoryColorOption,
+                      { backgroundColor: color },
+                      newCategoryColor === color && styles.categoryColorOptionActive,
+                    ]}
+                    onPress={() => setNewCategoryColor(color)}
+                    accessibilityLabel={`Selecionar cor ${color}`}
+                  >
+                    {newCategoryColor === color && (
+                      <Ionicons name="checkmark" size={16} color={color === '#FFFFFF' ? '#111827' : '#ffffff'} />
+                    )}
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
+
             <View style={styles.catInputRow}>
               <TextInput
                 style={[styles.catInput, Platform.OS === 'web' ? { outlineStyle: 'none' } as any : {}]}
@@ -1023,6 +1253,15 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#660000',
   },
+  discardDialog: {
+    backgroundColor: '#111827',
+    borderRadius: 16,
+    padding: 24,
+    width: '80%',
+    maxWidth: 400,
+    borderWidth: 1,
+    borderColor: '#2a324a',
+  },
   deleteDialogTitle: {
     color: '#ffffff',
     fontSize: 18,
@@ -1050,6 +1289,12 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
   },
   deleteDialogConfirmBtn: {
+    backgroundColor: '#CC0000',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+  },
+  discardDialogConfirmBtn: {
     backgroundColor: '#CC0000',
     paddingVertical: 10,
     paddingHorizontal: 16,
@@ -1134,6 +1379,36 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: '#2a324a',
     paddingTop: 16,
+  },
+  categoryColorSection: {
+    borderTopWidth: 1,
+    borderTopColor: '#2a324a',
+    paddingTop: 16,
+    marginTop: 12,
+  },
+  categoryColorTitle: {
+    color: '#a0a7b5',
+    fontSize: 13,
+    fontWeight: '600',
+    marginBottom: 12,
+  },
+  categoryColorGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  categoryColorOption: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    borderWidth: 2,
+    borderColor: '#374151',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  categoryColorOptionActive: {
+    borderColor: '#ffffff',
+    transform: [{ scale: 1.08 }],
   },
   catInput: {
     flex: 1,
